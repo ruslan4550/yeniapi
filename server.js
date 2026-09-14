@@ -4,65 +4,95 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1. CORS - Bütün kənar (frontend) sorğulara icazə verir
 app.use(cors());
-
-// 2. 413 XƏTASININ HƏLLİ: Sənəd/Şəkil yüklənməsi üçün limiti 50MB edirik
+// 413 Payload Too Large xətasının qarşısını alan limit parametrləri
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 3. 404 XƏTASININ HƏLLİ: Frontend-in sorğu göndərdiyi ana (root) POST marşrutu
+// Sənin təqdim etdiyin Groq API Açarı
+const API_KEY = "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"; 
+
 app.post('/', async (req, res) => {
     try {
-        const { system, messages, plan, fileData } = req.body;
+        const { system, messages, fileData } = req.body;
 
-        // Əgər gələn sorğuda heç nə yoxdursa, geri qaytar (Təhlükəsizlik üçün)
         if (!messages && !fileData) {
             return res.status(400).json({
                 content: [{ text: "Xəta: Mesaj və ya sənəd tapılmadı." }]
             });
         }
 
-        // Konsolda sorğunu izləmək üçün
-        console.log(`[Yeni Sorğu] Plan: ${plan || 'Bilinmir'}`);
-        if (fileData) {
-            console.log(`[Sənəd] Adı: ${fileData.name}, Formatı: ${fileData.type}`);
+        let apiMessages = [];
+
+        // 1. Sistemin hüquqşünas rolunu (system prompt) əlavə edirik
+        if (system) {
+            apiMessages.push({ role: "system", content: system });
         }
 
-        // =====================================================================
-        // SÜNİ İNTELLEKT (API) KODU BURAYA YAZILMALIDIR (OpenAI, Gemini, vb.)
-        // =====================================================================
-        
-        let aiResponseText = "";
-
+        // 2. Əgər istifadəçi sənəd/şəkil yükləyibsə
         if (fileData) {
-            // Sənəd analizi üçün müvəqqəti cavab (Siz bura AI kodunuzu qoyacaqsınız)
-            aiResponseText = `"${fileData.name}" adlı sənəd serverə uğurla çatdı (413 xətası həll edildi). Sənədin analizi üçün AI API kodunuzu server.js faylına əlavə edin.`;
-        } else if (messages && messages.length > 0) {
-            // Normal chat üçün müvəqqəti cavab (Siz bura AI kodunuzu qoyacaqsınız)
-            const userLastMessage = messages[messages.length - 1].content;
-            aiResponseText = `Sizin mesajınız serverə uğurla çatdı (404 xətası həll edildi): "${userLastMessage}". Süni intellekt cavabını qaytarmaq üçün AI API kodunuzu aktivləşdirin.`;
+            apiMessages.push({
+                role: "user",
+                content: [
+                    { 
+                        type: "text", 
+                        text: "Zəhmət olmasa, bu sənədi hüquqi baxımdan analiz et, səhvləri, boşluqları aşkarla və düzəldilmiş variantını təqdim et." 
+                    },
+                    {
+                        type: "image_url",
+                        image_url: {
+                            // Frontend-dən gələn Base64 formatlı şəkli Groq-a ötürürük
+                            url: `data:${fileData.type};base64,${fileData.base64}`
+                        }
+                    }
+                ]
+            });
+        } 
+        // 3. Əgər sadəcə söhbət (Chat) panelidirsə
+        else if (messages && messages.length > 0) {
+            apiMessages = apiMessages.concat(messages);
         }
 
-        // =====================================================================
+        // Groq API-yə qoşulma sorğusu
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${API_KEY}`
+            },
+            body: JSON.stringify({
+                model: "llama-3.2-11b-vision-preview", // Groq-un şəkil və mətn oxuyan modeli
+                messages: apiMessages,
+                temperature: 0.5 
+            })
+        });
 
-        // Frontend-in tam gözlədiyi formatda (data.content[0].text) cavabın qaytarılması
+        const data = await response.json();
+
+        // API tərəfindən hər hansı xəta gələrsə
+        if (!response.ok) {
+            console.error("API Xətası:", data);
+            return res.status(500).json({
+                content: [{ text: `Süni intellekt xətası: ${data.error?.message || 'Bilinməyən xəta'}` }]
+            });
+        }
+
+        // AI-dan gələn real cavabı alırıq
+        const aiResponseText = data.choices[0].message.content;
+
+        // Frontend-in tam gözlədiyi formatda geri qaytarırıq
         return res.json({
-            content: [
-                { text: aiResponseText }
-            ]
+            content: [{ text: aiResponseText }]
         });
 
     } catch (error) {
-        console.error("Server xətası:", error);
-        // Hər hansı qırılma olarsa, frontend-ə crash vermədən səbəbi qaytarır
+        console.error("Server daxili xətası:", error);
         return res.status(500).json({
-            content: [{ text: "Backend xətası: " + error.message }]
+            content: [{ text: "Backend server xətası: " + error.message }]
         });
     }
 });
 
-// Serveri işə salırıq
 app.listen(PORT, () => {
     console.log(`🚀 Server uğurla işə salındı! Port: ${PORT}`);
 });
