@@ -1,57 +1,68 @@
 const express = require('express');
 const cors = require('cors');
-const { Groq } = require('groq-sdk');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Bütün domenlərdən (Frontend-dən) gələn sorğulara icazə veririk
+// 1. CORS - Bütün kənar (frontend) sorğulara icazə verir
 app.use(cors());
-app.use(express.json());
 
-// Sizin verdiyiniz Groq API Açarı
-const groq = new Groq({
-    apiKey: "Gsk_LHPCYaMCe0Ur0LpGXkOTWGdyb3FYgokha7gN8qNajlSvAxEEeCvq"
-});
+// 2. 413 XƏTASININ HƏLLİ: Sənəd/Şəkil yüklənməsi üçün limiti 50MB edirik
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Süni intellektə mesaj göndərmək üçün ana endpoint
-app.post('/api/chat', async (req, res) => {
+// 3. 404 XƏTASININ HƏLLİ: Frontend-in sorğu göndərdiyi ana (root) POST marşrutu
+app.post('/', async (req, res) => {
     try {
-        const { message } = req.body;
-        
-        if (!message) {
-            return res.status(400).json({ error: "Mesaj boş ola bilməz" });
+        const { system, messages, plan, fileData } = req.body;
+
+        // Əgər gələn sorğuda heç nə yoxdursa, geri qaytar (Təhlükəsizlik üçün)
+        if (!messages && !fileData) {
+            return res.status(400).json({
+                content: [{ text: "Xəta: Mesaj və ya sənəd tapılmadı." }]
+            });
         }
 
-        // Groq API-yə sorğu göndəririk (Sürətli LLaMA modelindən istifadə edilir)
-        const chatCompletion = await groq.chat.completions.create({
-            messages: [
-                {
-                    role: "system",
-                    content: "Sən azərbaycan dilində kömək edən, ağıllı və peşəkar bir süni intellekt asistanısan. Bütün suallara dəqiq və aydın cavab verirsən."
-                },
-                {
-                    role: "user",
-                    content: message
-                }
-            ],
-            model: "llama3-8b-8192", 
-            temperature: 0.7,
-            max_tokens: 2048,
+        // Konsolda sorğunu izləmək üçün
+        console.log(`[Yeni Sorğu] Plan: ${plan || 'Bilinmir'}`);
+        if (fileData) {
+            console.log(`[Sənəd] Adı: ${fileData.name}, Formatı: ${fileData.type}`);
+        }
+
+        // =====================================================================
+        // SÜNİ İNTELLEKT (API) KODU BURAYA YAZILMALIDIR (OpenAI, Gemini, vb.)
+        // =====================================================================
+        
+        let aiResponseText = "";
+
+        if (fileData) {
+            // Sənəd analizi üçün müvəqqəti cavab (Siz bura AI kodunuzu qoyacaqsınız)
+            aiResponseText = `"${fileData.name}" adlı sənəd serverə uğurla çatdı (413 xətası həll edildi). Sənədin analizi üçün AI API kodunuzu server.js faylına əlavə edin.`;
+        } else if (messages && messages.length > 0) {
+            // Normal chat üçün müvəqqəti cavab (Siz bura AI kodunuzu qoyacaqsınız)
+            const userLastMessage = messages[messages.length - 1].content;
+            aiResponseText = `Sizin mesajınız serverə uğurla çatdı (404 xətası həll edildi): "${userLastMessage}". Süni intellekt cavabını qaytarmaq üçün AI API kodunuzu aktivləşdirin.`;
+        }
+
+        // =====================================================================
+
+        // Frontend-in tam gözlədiyi formatda (data.content[0].text) cavabın qaytarılması
+        return res.json({
+            content: [
+                { text: aiResponseText }
+            ]
         });
 
-        const reply = chatCompletion.choices[0]?.message?.content || "Cavab alına bilmədi.";
-        
-        // Nəticəni Frontend-ə qaytarırıq
-        res.json({ reply: reply });
-
     } catch (error) {
-        console.error("API Xətası:", error);
-        res.status(500).json({ error: "Serverdə xəta baş verdi. Zəhmət olmasa yenidən yoxlayın." });
+        console.error("Server xətası:", error);
+        // Hər hansı qırılma olarsa, frontend-ə crash vermədən səbəbi qaytarır
+        return res.status(500).json({
+            content: [{ text: "Backend xətası: " + error.message }]
+        });
     }
 });
 
-// Serverin işə düşməsi
-const PORT = process.env.PORT || 3000;
+// Serveri işə salırıq
 app.listen(PORT, () => {
-    console.log(`Server uğurla işə düşdü! Port: ${PORT}`);
+    console.log(`🚀 Server uğurla işə salındı! Port: ${PORT}`);
 });
