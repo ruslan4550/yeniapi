@@ -44,7 +44,7 @@ app.post('/', async (req, res) => {
                 "Authorization": `Bearer ${API_KEY}`
             },
             body: JSON.stringify({
-                model: "llama-3.3-70b-versatile",
+                model: "llama-3.1-8b-instant",
                 messages: apiMessages,
                 temperature: 0.5
             })
