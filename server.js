@@ -4,14 +4,17 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Bütün domenlərdən (frontend-dən) gələn sorğulara icazə
 app.use(cors());
-// 413 Payload Too Large xətasının qarşısını alan limit parametrləri
+
+// 413 Payload Too Large xətasının həlli üçün limit 50MB təyin edilir
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Sənin təqdim etdiyin Groq API Açarı
+// Sənin verdiyin Groq API Açarı
 const API_KEY = "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"; 
 
+// 404 xətasını həll edən əsas (root) POST marşrutu
 app.post('/', async (req, res) => {
     try {
         const { system, messages, fileData } = req.body;
@@ -23,14 +26,15 @@ app.post('/', async (req, res) => {
         }
 
         let apiMessages = [];
+        let selectedModel = "llama-3.3-70b-versatile"; // Standart mətn modeli
 
-        // 1. Sistemin hüquqşünas rolunu (system prompt) əlavə edirik
         if (system) {
             apiMessages.push({ role: "system", content: system });
         }
 
-        // 2. Əgər istifadəçi sənəd/şəkil yükləyibsə
         if (fileData) {
+            // Sənəd və ya şəkil olduqda Vision modeli aktivləşir
+            selectedModel = "llama-3.2-11b-vision-instruct";
             apiMessages.push({
                 role: "user",
                 content: [
@@ -41,19 +45,15 @@ app.post('/', async (req, res) => {
                     {
                         type: "image_url",
                         image_url: {
-                            // Frontend-dən gələn Base64 formatlı şəkli Groq-a ötürürük
                             url: `data:${fileData.type};base64,${fileData.base64}`
                         }
                     }
                 ]
             });
-        } 
-        // 3. Əgər sadəcə söhbət (Chat) panelidirsə
-        else if (messages && messages.length > 0) {
+        } else if (messages && messages.length > 0) {
             apiMessages = apiMessages.concat(messages);
         }
 
-        // Groq API-yə qoşulma sorğusu
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -61,15 +61,14 @@ app.post('/', async (req, res) => {
                 "Authorization": `Bearer ${API_KEY}`
             },
             body: JSON.stringify({
-                model: "llama-3.2-11b-vision-preview", // Groq-un şəkil və mətn oxuyan modeli
+                model: selectedModel,
                 messages: apiMessages,
-                temperature: 0.5 
+                temperature: 0.5
             })
         });
 
         const data = await response.json();
 
-        // API tərəfindən hər hansı xəta gələrsə
         if (!response.ok) {
             console.error("API Xətası:", data);
             return res.status(500).json({
@@ -77,10 +76,8 @@ app.post('/', async (req, res) => {
             });
         }
 
-        // AI-dan gələn real cavabı alırıq
         const aiResponseText = data.choices[0].message.content;
 
-        // Frontend-in tam gözlədiyi formatda geri qaytarırıq
         return res.json({
             content: [{ text: aiResponseText }]
         });
