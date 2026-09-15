@@ -8,92 +8,187 @@ const PORT = process.env.PORT || 3000;
 // CORS və 50MB-a qədər böyük faylları (Base64) qəbul etmək üçün
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Sənin qeyd etdiyin OpenRouter API Key və Pulsuz Model
-const OPENROUTER_API_KEY = "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";
-const AI_MODEL = "google/gemini-2.0-flash-lite-preview-02-05:free"; // 100% pulsuz və sürətli model
+// Groq API və OpenRouter Mənbələri
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "gsk_free_key_placeholder";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "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";
 
-// 1. Söhbət End-pointi (Standart/Pulsuz paket üçün)
-app.post('/api/chat', async (req, res) => {
+// Groq ultra-sürətli pulsuz modeli
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const OPENROUTER_MODEL = "google/gemini-2.0-flash-lite-preview-02-05:free";
+
+// Dili təyin edən köməkçi təlimat funksiyası
+function getLanguageInstruction(lang) {
+    switch (lang) {
+        case 'ru':
+            return "ОБЯЗАТЕЛЬНО ОТВЕЧАЙ НА РУССКОМ ЯЗЫКЕ. Используй профессиональный юридический язык Российской Федерации/Азербайджана на русском языке.";
+        case 'en':
+            return "YOU MUST RESPOND STRICTLY IN ENGLISH. Use professional legal terminology in English.";
+        case 'az':
+        default:
+            return "MÜTLƏQ AZƏRBAYCAN DİLİNDƏ CAVAB VER. Azərbaycan Respublikasının qanunvericiliyinə uyğun peşəkar hüquqi terminologiyadan istifadə et.";
+    }
+}
+
+// AI ilə əlaqə yaradan vahid funksiya (Groq API öncəlikli, xəta halında OpenRouter fallback)
+async function getAICompletion(messages, systemPrompt) {
+    const formattedMessages = [
+        { role: "system", content: systemPrompt },
+        ...messages
+    ];
+
+    // 1. Birinci Groq API-ni yoxlayırıq (Ultra-sürətli)
+    if (process.env.GROQ_API_KEY || GROQ_API_KEY.startsWith("gsk_")) {
+        try {
+            const response = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+                model: GROQ_MODEL,
+                messages: formattedMessages,
+                temperature: 0.2,
+                max_tokens: 4096
+            }, {
+                headers: {
+                    "Authorization": `Bearer ${GROQ_API_KEY}`,
+                    "Content-Type": "application/json"
+                },
+                timeout: 30000
+            });
+
+            if (response.data && response.data.choices && response.data.choices[0]) {
+                return response.data.choices[0].message.content;
+            }
+        } catch (groqErr) {
+            console.warn("Groq API Xətası (OpenRouter-ə yönləndirilir):", groqErr.response ? groqErr.response.data : groqErr.message);
+        }
+    }
+
+    // 2. Groq cavab vermədikdə və ya Key olmadıqda OpenRouter Fallback
     try {
-        const { system, messages, plan } = req.body;
-        
-        const formattedMessages = [
-            { role: "system", content: system },
-            ...messages
-        ];
-
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            model: AI_MODEL,
+            model: OPENROUTER_MODEL,
             messages: formattedMessages
         }, {
             headers: {
                 "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
                 "Content-Type": "application/json"
-            }
+            },
+            timeout: 30000
         });
 
-        res.json({ content: [{ text: response.data.choices[0].message.content }] });
+        if (response.data && response.data.choices && response.data.choices[0]) {
+            return response.data.choices[0].message.content;
+        }
+    } catch (orErr) {
+        console.error("OpenRouter API Xətası:", orErr.response ? orErr.response.data : orErr.message);
+        throw new Error("AI xidmətindən cavab almaq mümkün olmadı.");
+    }
+
+    throw new Error("AI xidməti gözlənilməz cavab qaytardı.");
+}
+
+// 1. Söhbət End-pointi (Pulsuz, Premium, Biznes üçün)
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { system, messages, plan, lang } = req.body;
+
+        const langInstruction = getLanguageInstruction(lang || 'az');
+        const defaultSystem = system || "Sən Normisera hüquqi süni intellekt köməkçisisən.";
+        const fullSystemPrompt = `${defaultSystem}\n\n[DİL TƏLƏBİ]: ${langInstruction}`;
+
+        const validMessages = Array.isArray(messages) ? messages.map(m => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+        })) : [];
+
+        const answerText = await getAICompletion(validMessages, fullSystemPrompt);
+
+        res.json({ content: [{ text: answerText }] });
     } catch (error) {
-        console.error("Chat API Xətası:", error.response ? error.response.data : error.message);
-        res.status(500).json({ content: [{ text: "Sistemlə əlaqə qurularkən xəta baş verdi. Zəhmət olmasa yenidən cəhd edin." }] });
+        console.error("Chat API Xətası:", error.message);
+        res.status(500).json({ 
+            content: [{ text: "Sistemlə əlaqə qurularkən xəta baş verdi. Zəhmət olmasa bir az sonra təkrar cəhd edin." }] 
+        });
     }
 });
 
-// 2. Sənəd Analizi End-pointi (Yalnız Premium və Biznes)
+// 2. Sənəd Analizi End-pointi (Yalnız Premium və Biznes paketləri üçün)
 app.post('/api/analyze', async (req, res) => {
     try {
-        const { messages, plan, fileData } = req.body;
+        const { messages, plan, fileData, lang } = req.body;
 
-        // Pulsuz planın bu xidmətdən istifadəsinin qarşısını alırıq
         if (plan === "Pulsuz") {
-            return res.json({ content: [{ text: "Sənəd analizi yalnız Premium və Biznes paketlərində mövcuddur. Zəhmət olmasa paketinizi yüksəldin." }] });
+            return res.json({ 
+                content: [{ 
+                    text: "Sənəd analizi funksiyası yalnız Premium və Biznes paketlərində mövcuddur. Zəhmət olmasa paketinizi yeniləyin." 
+                }] 
+            });
         }
 
-        // Xüsusi Prompt: Riskləri tapmaq və düzəldilmiş versiyanı təqdim etmək
-        const systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analizatorusan. 
-İstifadəçinin göndərdiyi müqaviləni və ya sənədi tam analiz et.
-1. Sənəddəki BÜTÜN HÜQUQİ RİSKLƏRİ və istifadəçi üçün zərərli ola biləcək bəndləri aşkarla.
-2. Həmin riskli bəndləri DÜZƏLDƏRƏK tamamilə risksiz, istifadəçinin xeyrinə olan yeni, təhlükəsiz versiyasını mütləq təqdim et.
-Cavabını Markdown formatında, səliqəli və aydın strukturla ver.`;
+        const langInstruction = getLanguageInstruction(lang || 'az');
 
-        let contentArray = [];
-        
-        // Şəkil faylıdırsa (JPG/PNG) Base64 olaraq OpenRouter-ə göndəririk
-        if (fileData && fileData.type.startsWith('image/')) {
-            contentArray.push({
-                type: "image_url",
-                image_url: { url: `data:${fileData.type};base64,${fileData.base64}` }
-            });
-            contentArray.push({ type: "text", text: messages[0]?.content || "Bu sənədi hüquqi baxımdan analiz et." });
-        } else if (fileData) {
-            // PDF, DOCX kimi sənədlər üçün məzmun xəbərdarlığı
-            contentArray.push({ 
-                type: "text", 
-                text: `Sənəd yükləndi: ${fileData.name}. Bu sənədin məzmununu aşağıdakı tələblərə əsasən analiz et:\n${messages[0]?.content || "Sənədi analiz et və riskləri tap."}` 
-            });
+        // Xüsusi Prompt: Riskləri aşkar etmək və DÜZƏLDİLMİŞ risksiz müqavilə/sənədi çıxarmaq
+        const systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analitikisən.
+Təqdim olunan sənədi və ya müqavilə mətnini dərindən təhlil et.
+
+CAVABIN STRUKTURU VƏ BÖLMƏLƏRİ:
+1. ⚠️ **HÜQUQİ RİSKLƏR VƏ ZƏRƏRLİ BƏNDLƏR**:
+   - Sənəddə istifadəçi üçün riskli, birtərəfli, cərimə yükü yaradan və ya hüquqları məhdudlaşdıran BÜTÜN maddələri bənd-bənd göstər və izah et.
+
+2. 🛡️ **DÜZƏLDİLMİŞ VƏ RİSKSIZ MÜQAVİLƏ (SƏNƏD MƏTNİ)**:
+   - Sənədi tamamilə yenidən tərtib et.
+   - Bütün riskli bəndləri sil və ya istifadəçinin xeyrinə, tam hüquqi təhlükəsiz variantla əvəz et.
+   - Düzəldilmiş risksiz müqavilə mətnini İSTİFADƏYƏ HAZIR ŞƏKİLDƏ (müqavilə forması kimi) tam təqdim et.
+
+[DİL TƏLƏBİ]: ${langInstruction}`;
+
+        let userPromptText = "";
+        if (messages && messages.length > 0) {
+            userPromptText = messages[messages.length - 1].content || "";
+        }
+
+        if (fileData) {
+            userPromptText = `[YÜKLƏNƏN FAYL ADI]: ${fileData.name}\n[FAYL MƏZMUNU/BƏYAN]: ${fileData.text || "Fayl göndərildi"}\n\nİstifadəçi sorğusu: ${userPromptText || "Sənədi analiz et, riskləri tap və düzəldilmiş risksiz müqaviləni çıxar."}`;
         }
 
         const formattedMessages = [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: contentArray }
+            { role: "user", content: userPromptText }
         ];
 
-        const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            model: AI_MODEL,
-            messages: formattedMessages
-        }, {
-            headers: {
-                "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-                "Content-Type": "application/json"
-            }
-        });
+        const answerText = await getAICompletion(formattedMessages, systemPrompt);
 
-        res.json({ content: [{ text: response.data.choices[0].message.content }] });
+        res.json({ content: [{ text: answerText }] });
     } catch (error) {
-        console.error("Analyze API Xətası:", error.response ? error.response.data : error.message);
-        res.status(500).json({ content: [{ text: "Analiz zamanı xəta baş verdi. Fayl formatını yoxlayın və ya təkrar cəhd edin." }] });
+        console.error("Analyze API Xətası:", error.message);
+        res.status(500).json({ 
+            content: [{ text: "Sənəd analizi zamanı xəta baş verdi. Fayl formatını yoxlayın və ya yenidən cəhd edin." }] 
+        });
     }
+});
+
+// 3. Text-to-Speech (TTS) End-pointi (Səsli oxuma üçün)
+app.get('/api/tts', async (req, res) => {
+    try {
+        const text = req.query.text;
+        const lang = req.query.lang || 'az';
+
+        if (!text) {
+            return res.status(400).send("Mətn parametri tələb olunur");
+        }
+
+        const cleanText = text.replace(/<[^>]*>?/gm, '').replace(/[*_#`~]/g, '').slice(0, 300);
+        const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=${lang}&client=tw-ob`;
+
+        const response = await axios.get(ttsUrl, { responseType: 'stream' });
+        res.set('Content-Type', 'audio/mpeg');
+        response.data.pipe(res);
+    } catch (error) {
+        console.error("TTS Xətası:", error.message);
+        res.status(500).send("Səs yaradılarkən xəta baş verdi");
+    }
+});
+
+app.get('/', (req, res) => {
+    res.send("Normisera Backend API Server is running smoothly!");
 });
 
 app.listen(PORT, () => console.log(`API Server is running on port ${PORT}`));
