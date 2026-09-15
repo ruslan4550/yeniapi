@@ -24,9 +24,17 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ================== GROQ AYARLARI ==================
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "gsk_free_key_placeholder";
+// Açar Render-də Environment Variable kimi təyin olunur: GROQ_API_KEY
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
+
+// Başlanğıc yoxlaması
+console.log("=========================================");
+console.log("GROQ_API_KEY təyin olunub:", !!GROQ_API_KEY);
+console.log("GROQ_API_KEY uzunluq:", GROQ_API_KEY.length);
+console.log("GROQ_API_KEY prefix:", GROQ_API_KEY.slice(0, 8) + "...");
+console.log("=========================================");
 
 // ================== DİL TƏLİMATI ==================
 function getLanguageInstruction(lang) {
@@ -43,64 +51,99 @@ function getLanguageInstruction(lang) {
 
 // ================== GROQ CHAT ==================
 async function callGroqChat(messages, systemPrompt) {
+  if (!GROQ_API_KEY || !GROQ_API_KEY.startsWith("gsk_")) {
+    throw new Error("GROQ_API_KEY təyin olunmayıb. Render → Environment bölməsinə əlavə edin.");
+  }
+
   const formatted = [
     { role: "system", content: systemPrompt },
     ...messages
   ];
 
-  const response = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model: GROQ_CHAT_MODEL,
-      messages: formatted,
-      temperature: 0.2,
-      max_tokens: 4096
-    },
-    {
-      headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json"
+  try {
+    const response = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: GROQ_CHAT_MODEL,
+        messages: formatted,
+        temperature: 0.2,
+        max_tokens: 4096
       },
-      timeout: 45000
-    }
-  );
+      {
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 45000
+      }
+    );
 
-  const choice = response.data?.choices?.[0]?.message?.content;
-  if (!choice) throw new Error("Groq boş cavab qaytardı");
-  return choice;
+    const choice = response.data?.choices?.[0]?.message?.content;
+    if (!choice) throw new Error("Groq boş cavab qaytardı");
+    return choice;
+  } catch (err) {
+    const status = err.response?.status;
+    const detail = err.response?.data;
+    console.error("Groq xətası | status:", status, "| detail:", JSON.stringify(detail));
+
+    if (status === 401) {
+      throw new Error("Groq API açarı etibarsızdır (401). Render-də GROQ_API_KEY-i yeniləyin.");
+    }
+    if (status === 429) {
+      throw new Error("Groq limiti aşıldı (429). Bir az sonra yenidən cəhd edin.");
+    }
+    if (detail?.error?.message) {
+      throw new Error("Groq: " + detail.error.message);
+    }
+    throw new Error("Groq xətası: " + (err.message || "Bilinməyən"));
+  }
 }
 
 // ================== GROQ VISION (şəkillər) ==================
 async function callGroqVision(systemPrompt, userText, imageDataUrl) {
-  const response = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model: GROQ_VISION_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: userText },
-            { type: "image_url", image_url: { url: imageDataUrl } }
-          ]
-        }
-      ],
-      temperature: 0.2,
-      max_tokens: 4096
-    },
-    {
-      headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      timeout: 90000
-    }
-  );
+  if (!GROQ_API_KEY || !GROQ_API_KEY.startsWith("gsk_")) {
+    throw new Error("GROQ_API_KEY təyin olunmayıb.");
+  }
 
-  const choice = response.data?.choices?.[0]?.message?.content;
-  if (!choice) throw new Error("Groq Vision boş cavab qaytardı");
-  return choice;
+  try {
+    const response = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: GROQ_VISION_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: userText },
+              { type: "image_url", image_url: { url: imageDataUrl } }
+            ]
+          }
+        ],
+        temperature: 0.2,
+        max_tokens: 4096
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 90000
+      }
+    );
+
+    const choice = response.data?.choices?.[0]?.message?.content;
+    if (!choice) throw new Error("Groq Vision boş cavab qaytardı");
+    return choice;
+  } catch (err) {
+    const status = err.response?.status;
+    const detail = err.response?.data;
+    console.error("Groq Vision xətası | status:", status, "| detail:", JSON.stringify(detail));
+
+    if (status === 401) throw new Error("Groq API açarı etibarsızdır (401).");
+    if (detail?.error?.message) throw new Error("Groq Vision: " + detail.error.message);
+    throw new Error("Groq Vision xətası: " + (err.message || "Bilinməyən"));
+  }
 }
 
 // ================== FAYLDAN MƏTN ÇIXARMA ==================
@@ -174,7 +217,7 @@ app.post('/api/chat', async (req, res) => {
   } catch (error) {
     console.error("Chat API xətası:", error.message);
     res.status(500).json({
-      content: [{ text: "Sistemlə əlaqə qurularkən xəta baş verdi. Zəhmət olmasa bir az sonra təkrar cəhd edin." }]
+      content: [{ text: "Xəta: " + error.message }]
     });
   }
 });
@@ -294,11 +337,19 @@ app.get('/api/tts', async (req, res) => {
   }
 });
 
-// ================== Sağlamlıq ==================
+// ================== Sağlamlıq yoxlaması ==================
 app.get('/', (req, res) => {
   res.send("Normisera Backend API işləyir ✅");
 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => {
+  const keyValid = !!GROQ_API_KEY && GROQ_API_KEY.startsWith("gsk_") && GROQ_API_KEY.length > 20;
+  res.json({
+    ok: true,
+    groqKeySet: keyValid,
+    keyLength: GROQ_API_KEY.length,
+    keyPrefix: GROQ_API_KEY ? GROQ_API_KEY.slice(0, 8) + "..." : "yoxdur"
+  });
+});
 
-app.listen(PORT, () => console.log(`API Server portda işləyir: ${PORT}`));
+app.listen(PORT, () => console.log(`✅ API Server portda işləyir: ${PORT}`));
