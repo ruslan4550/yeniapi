@@ -5,24 +5,30 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS + 50MB fayl limiti
-app.use(cors({ origin: '*' }));
+// ================== CORS + Body limiti ==================
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
+
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.sendStatus(200);
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ================== GROQ API ==================
-const GROQ_API_KEY =
-  process.env.GROQ_API_KEY || "gsk_free_key_placeholder";
+// ================== GROQ AYARLARI ==================
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "gsk_free_key_placeholder";
+const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
 
-const GROQ_CHAT_MODEL =
-  process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-
-// Vision (şəkil) dəstəyi üçün Groq modeli
-const GROQ_VISION_MODEL =
-  process.env.GROQ_VISION_MODEL ||
-  "meta-llama/llama-4-scout-17b-16e-instruct";
-
-// ============ DİL TƏLİMATI ============
+// ================== DİL TƏLİMATI ==================
 function getLanguageInstruction(lang) {
   switch (lang) {
     case 'ru':
@@ -35,7 +41,7 @@ function getLanguageInstruction(lang) {
   }
 }
 
-// ============ GROQ CHAT ============
+// ================== GROQ CHAT ==================
 async function callGroqChat(messages, systemPrompt) {
   const formatted = [
     { role: "system", content: systemPrompt },
@@ -64,7 +70,7 @@ async function callGroqChat(messages, systemPrompt) {
   return choice;
 }
 
-// ============ GROQ VISION (şəkillər üçün) ============
+// ================== GROQ VISION (şəkillər) ==================
 async function callGroqVision(systemPrompt, userText, imageDataUrl) {
   const response = await axios.post(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -88,7 +94,7 @@ async function callGroqVision(systemPrompt, userText, imageDataUrl) {
         "Authorization": `Bearer ${GROQ_API_KEY}`,
         "Content-Type": "application/json"
       },
-      timeout: 60000
+      timeout: 90000
     }
   );
 
@@ -97,7 +103,7 @@ async function callGroqVision(systemPrompt, userText, imageDataUrl) {
   return choice;
 }
 
-// ============ FAYLDAN MƏTN ÇIXARMA ============
+// ================== FAYLDAN MƏTN ÇIXARMA ==================
 async function extractTextFromFile(fileData) {
   if (!fileData || !fileData.base64) return null;
 
@@ -147,7 +153,7 @@ async function extractTextFromFile(fileData) {
   return null;
 }
 
-// ============ 1. CHAT ENDPOINT ============
+// ================== 1. CHAT ENDPOINT ==================
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages, plan, lang } = req.body;
@@ -173,7 +179,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// ============ 2. SƏNƏD ANALİZİ ENDPOINT ============
+// ================== 2. SƏNƏD ANALİZİ ENDPOINT ==================
 app.post('/api/analyze', async (req, res) => {
   try {
     const { messages, plan, fileData, lang } = req.body;
@@ -215,14 +221,12 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
     let answerText;
 
     if (isImage) {
-      // Şəkillər üçün Groq Vision
       const dataUrl = `data:${fileData.type};base64,${fileData.base64}`;
       const userText =
         (messages && messages[0]?.content) ||
         "Bu sənədi analiz et: riskləri göstər və düzəldilmiş risksiz versiyanı çıxar.";
       answerText = await callGroqVision(systemPrompt, userText, dataUrl);
     } else {
-      // PDF / DOCX / XLSX üçün mətn çıxar və chat modelinə göndər
       const extracted = await extractTextFromFile(fileData);
 
       if (!extracted || extracted.trim().length < 10) {
@@ -233,7 +237,6 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
         });
       }
 
-      // Çox uzun mətnləri kəs
       const trimmed = extracted.slice(0, 15000);
 
       const userContent = `Aşağıdakı sənədi hüquqi baxımdan tam analiz et, riskli bəndləri göstər və düzəldilmiş risksiz müqaviləni tam şəkildə təqdim et:\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`;
@@ -255,15 +258,14 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
   }
 });
 
-// ============ 3. TTS (Text-to-Speech) ============
+// ================== 3. TTS (Text-to-Speech) ==================
 app.get('/api/tts', async (req, res) => {
   try {
     const text = (req.query.text || '').toString();
-    let lang = (req.query.lang || 'az').toString();
+    const lang = (req.query.lang || 'az').toString();
 
     if (!text) return res.status(400).send("Mətn tələb olunur");
 
-    // Google TTS dəstəklənən dillər
     const langMap = { az: 'az', ru: 'ru', en: 'en' };
     const tl = langMap[lang] || 'az';
 
@@ -292,7 +294,7 @@ app.get('/api/tts', async (req, res) => {
   }
 });
 
-// ============ Sağlamlıq yoxlaması ============
+// ================== Sağlamlıq ==================
 app.get('/', (req, res) => {
   res.send("Normisera Backend API işləyir ✅");
 });
