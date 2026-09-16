@@ -24,14 +24,16 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ================== GROQ AYARLARI ==================
+// GROQ API açarı Render-də Environment Variable kimi oxunur
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
+const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "llama-3.2-11b-vision-preview";
 
 console.log("=========================================");
 console.log("GROQ_API_KEY təyin olunub:", !!GROQ_API_KEY);
-console.log("GROQ_API_KEY uzunluq:", GROQ_API_KEY.length);
-console.log("GROQ_API_KEY prefix:", GROQ_API_KEY.slice(0, 8) + "...");
+if (GROQ_API_KEY) {
+  console.log("GROQ_API_KEY prefix:", GROQ_API_KEY.slice(0, 8) + "...");
+}
 console.log("=========================================");
 
 // ================== DİL TƏLİMATI ==================
@@ -47,7 +49,7 @@ function getLanguageInstruction(lang) {
   }
 }
 
-// ================== GROQ CHAT ==================
+// ================== GROQ CHAT (Fallback dəstəyi ilə) ==================
 async function callGroqChat(messages, systemPrompt) {
   if (!GROQ_API_KEY || !GROQ_API_KEY.startsWith("gsk_")) {
     throw new Error("GROQ_API_KEY təyin olunmayıb. Render → Environment bölməsinə əlavə edin.");
@@ -58,40 +60,39 @@ async function callGroqChat(messages, systemPrompt) {
     ...messages
   ];
 
-  try {
-    const response = await axios.post(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        model: GROQ_CHAT_MODEL,
-        messages: formatted,
-        temperature: 0.2,
-        max_tokens: 4096
-      },
-      {
-        headers: {
-          "Authorization": `Bearer ${GROQ_API_KEY}`,
-          "Content-Type": "application/json"
+  const modelsToTry = [GROQ_CHAT_MODEL, "llama-3.1-8b-instant", "llama3-70b-8192"];
+
+  for (const model of modelsToTry) {
+    try {
+      const response = await axios.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          model: model,
+          messages: formatted,
+          temperature: 0.2,
+          max_tokens: 4096
         },
-        timeout: 45000
+        {
+          headers: {
+            "Authorization": `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          timeout: 45000
+        }
+      );
+
+      const choice = response.data?.choices?.[0]?.message?.content;
+      if (choice) return choice;
+    } catch (err) {
+      console.warn(`Model ${model} xətası, növbəti model yoxlanılır...`, err.message);
+      if (model === modelsToTry[modelsToTry.length - 1]) {
+        throw new Error("Groq API xətası: " + (err.response?.data?.error?.message || err.message));
       }
-    );
-
-    const choice = response.data?.choices?.[0]?.message?.content;
-    if (!choice) throw new Error("Groq boş cavab qaytardı");
-    return choice;
-  } catch (err) {
-    const status = err.response?.status;
-    const detail = err.response?.data;
-    console.error("Groq xətası | status:", status, "| detail:", JSON.stringify(detail));
-
-    if (status === 401) throw new Error("Groq API açarı etibarsızdır (401).");
-    if (status === 429) throw new Error("Groq limiti aşıldı (429). Bir az sonra yenidən cəhd edin.");
-    if (detail?.error?.message) throw new Error("Groq: " + detail.error.message);
-    throw new Error("Groq xətası: " + (err.message || "Bilinməyən"));
+    }
   }
 }
 
-// ================== GROQ VISION ==================
+// ================== GROQ VISION (Şəkillər üçün) ==================
 async function callGroqVision(systemPrompt, userText, imageDataUrl) {
   if (!GROQ_API_KEY || !GROQ_API_KEY.startsWith("gsk_")) {
     throw new Error("GROQ_API_KEY təyin olunmayıb.");
@@ -128,13 +129,8 @@ async function callGroqVision(systemPrompt, userText, imageDataUrl) {
     if (!choice) throw new Error("Groq Vision boş cavab qaytardı");
     return choice;
   } catch (err) {
-    const status = err.response?.status;
-    const detail = err.response?.data;
-    console.error("Groq Vision xətası | status:", status, "| detail:", JSON.stringify(detail));
-
-    if (status === 401) throw new Error("Groq API açarı etibarsızdır (401).");
-    if (detail?.error?.message) throw new Error("Groq Vision: " + detail.error.message);
-    throw new Error("Groq Vision xətası: " + (err.message || "Bilinməyən"));
+    console.error("Groq Vision xətası:", err.message);
+    throw new Error("Groq Vision xətası: " + (err.response?.data?.error?.message || err.message));
   }
 }
 
@@ -147,37 +143,44 @@ async function extractTextFromFile(fileData) {
   const name = (fileData.name || '').toLowerCase();
 
   try {
+    // PDF
     if (type.includes('pdf') || name.endsWith('.pdf')) {
-      const pdfParse = require('pdf-parse');
-      const data = await pdfParse(buffer);
-      return data.text || '';
+      try {
+        const pdfParse = require('pdf-parse');
+        const data = await pdfParse(buffer);
+        if (data && data.text) return data.text;
+      } catch (e) {
+        console.warn("pdf-parse uğursuz oldu, UTF-8 kimi dənənir");
+      }
+      return buffer.toString('utf-8').replace(/[^\x20-\x7E\n\r\t]/g, '');
     }
-    if (
-      type.includes('wordprocessingml') ||
-      type.includes('officedocument') ||
-      name.endsWith('.docx')
-    ) {
-      const mammoth = require('mammoth');
-      const result = await mammoth.extractRawText({ buffer });
-      return result.value || '';
+    // DOCX
+    if (type.includes('wordprocessingml') || type.includes('officedocument') || name.endsWith('.docx')) {
+      try {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ buffer });
+        if (result && result.value) return result.value;
+      } catch (e) {
+        console.warn("mammoth xətası");
+      }
     }
-    if (
-      type.includes('spreadsheetml') ||
-      name.endsWith('.xlsx') ||
-      name.endsWith('.xls')
-    ) {
-      const XLSX = require('xlsx');
-      const wb = XLSX.read(buffer, { type: 'buffer' });
-      let text = '';
-      wb.SheetNames.forEach(sn => {
-        text += `\n--- Sheet: ${sn} ---\n`;
-        text += XLSX.utils.sheet_to_csv(wb.Sheets[sn]);
-      });
-      return text;
+    // XLSX
+    if (type.includes('spreadsheetml') || name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      try {
+        const XLSX = require('xlsx');
+        const wb = XLSX.read(buffer, { type: 'buffer' });
+        let text = '';
+        wb.SheetNames.forEach(sn => {
+          text += `\n--- Sheet: ${sn} ---\n`;
+          text += XLSX.utils.sheet_to_csv(wb.Sheets[sn]);
+        });
+        return text;
+      } catch (e) {
+        console.warn("xlsx xətası");
+      }
     }
-    if (type.includes('text/plain') || name.endsWith('.txt')) {
-      return buffer.toString('utf-8');
-    }
+    // TXT və digər mətnlər
+    return buffer.toString('utf-8');
   } catch (e) {
     console.error("Fayl emalı xətası:", e.message);
   }
@@ -204,17 +207,14 @@ app.post('/api/chat', async (req, res) => {
     res.json({ content: [{ text: answerText }] });
   } catch (error) {
     console.error("Chat API xətası:", error.message);
-    res.status(500).json({
-      content: [{ text: "Xəta: " + error.message }]
-    });
+    res.status(500).json({ content: [{ text: "Xəta: " + error.message }] });
   }
 });
 
-// ================== 2. SƏNƏD ANALİZİ ENDPOINT (İKİ MƏRHƏLƏLİ) ==================
+// ================== 2. SƏNƏD ANALİZİ ENDPOINT ==================
 app.post('/api/analyze', async (req, res) => {
   try {
-    const { messages, plan, fileData, lang, mode } = req.body;
-    // mode: 'risks' (default) | 'safe'
+    const { messages, plan, fileData, lang } = req.body;
 
     if (plan === "Pulsuz") {
       return res.json({
@@ -231,37 +231,22 @@ app.post('/api/analyze', async (req, res) => {
     }
 
     const langInstr = getLanguageInstruction(lang || 'az');
-    const isSafeMode = mode === 'safe';
 
-    let systemPrompt;
-    if (isSafeMode) {
-      systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünassan.
-Təqdim olunan sənədin TAM RİSKSİZ, İSTİFADƏYƏ HAZIR VERSİYASINI hazırla.
+    const systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analitikisən.
+Təqdim olunan sənədi dərindən təhlil et.
 
-TƏLƏBLƏR:
-- Bütün riskli, birtərəfli, cərimə yükü yaradan, hüquqları məhdudlaşdıran bəndləri sil və ya istifadəçinin xeyrinə dəyişdir.
-- Sənədin tam strukturunu (başlıq, tərəflər, bəndlər, imza yeri) qoru.
-- Mətn HÜQUQİ CƏHƏTDƏN TƏHLÜKƏSİZ və BALANSLI olsun.
-- TAM müqavilə mətnini (başlıqdan imza yerinə qədər) təqdim et.
-- HEÇ BİR əlavə izah, giriş və ya nəticə yazma - YALNIZ sənədin özünü ver.
+CAVABINI MÜTLƏQ AŞAĞIDAKI DƏQİQ STRUKTURDA TƏQDİM ET:
 
-[DİL TƏLƏBİ]: ${langInstr}`;
-    } else {
-      systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analitikisən.
-Təqdim olunan sənədi dərindən təhlil et və YALNIZ aşağıdakı strukturu təqdim et:
+### ⚠️ HÜQUQİ RİSKLƏR VƏ ZƏRƏRLİ BƏNDLƏR
+- Sənəddə istifadəçi üçün riskli, birtərəfli, ağır cərimə yaradan və hüquqları məhdudlaşdıran maddələri aydın göstər.
 
-1. ⚠️ HÜQUQİ RİSKLƏR VƏ ZƏRƏRLİ BƏNDLƏR
-   - Sənəddə istifadəçi üçün riskli, birtərəfli, cərimə yükü yaradan və ya hüquqları məhdudlaşdıran BÜTÜN maddələri bənd-bənd göstər və izah et.
-   - Hər bir bənd üçün: "Bənd X: [risk təsviri] → [niyə risklidir]"
+--- DÜZƏLDİLMİŞ RİSKSIZ SƏNƏD ---
 
-2. 📋 ÜMUMİ HÜQUQİ QİYMƏTLƏNDİRMƏ
-   - Sənədin ümumi hüquqi vəziyyəti və istifadəçiyə tövsiyələr.
-
-QADAĞAN: Düzəldilmiş/risksiz versiyanı YAZMA - istifadəçi ayrıca tələb edəcək.
-Yalnız analiz və riskləri göstər.
+### 🛡️ DÜZƏLDİLMİŞ VƏ RİSKSİZ SƏNƏD MƏTNİ
+- Bütün riskli bəndləri sil və istifadəçinin xeyrinə tam hüquqi təhlükəsiz maddələrlə əvəzlə.
+- Risksiz sənədi tam, istifadəyə və yükləməyə hazır şəkildə tərtib et.
 
 [DİL TƏLƏBİ]: ${langInstr}`;
-    }
 
     const fileType = (fileData.type || '').toLowerCase();
     const isImage = fileType.startsWith('image/');
@@ -270,26 +255,21 @@ Yalnız analiz və riskləri göstər.
 
     if (isImage) {
       const dataUrl = `data:${fileData.type};base64,${fileData.base64}`;
-      const userText = isSafeMode
-        ? "Bu sənədin tam risksiz, istifadəyə hazır versiyasını hazırla. Yalnız sənədin özünü ver."
-        : "Bu sənədi analiz et və yalnız riskli bəndləri göstər.";
+      const userText = (messages && messages[0]?.content) || "Bu sənədi analiz et: riskləri göstər və düzəldilmiş risksiz versiyanı çıxar.";
       answerText = await callGroqVision(systemPrompt, userText, dataUrl);
     } else {
       const extracted = await extractTextFromFile(fileData);
 
-      if (!extracted || extracted.trim().length < 10) {
+      if (!extracted || extracted.trim().length < 5) {
         return res.json({
           content: [{
-            text: "Sənəddən mətn oxuna bilmədi. Zəhmət olmasa aydın şəkil (JPG/PNG) və ya mətn əsaslı PDF yükləyin."
+            text: "Sənəddən mətn oxuna bilmədi. Zəhmət olmasa aydın şəkil (JPG/PNG) və ya PDF/DOCX yükləyin."
           }]
         });
       }
 
       const trimmed = extracted.slice(0, 15000);
-
-      const userContent = isSafeMode
-        ? `Aşağıdakı sənədin TAM RİSKSİZ, İSTİFADƏYƏ HAZIR VERSİYASINI hazırla (yalnız sənədin özünü ver, izah yazma):\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`
-        : `Aşağıdakı sənədi hüquqi baxımdan təhlil et və YALNIZ riskli bəndləri bənd-bənd göstər:\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`;
+      const userContent = `Aşağıdakı sənədi analiz et, riskli bəndləri göstər və düzəldilmiş risksiz müqaviləni təqdim et:\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`;
 
       answerText = await callGroqChat(
         [{ role: 'user', content: userContent }],
@@ -301,14 +281,12 @@ Yalnız analiz və riskləri göstər.
   } catch (error) {
     console.error("Analyze API xətası:", error.message);
     res.status(500).json({
-      content: [{
-        text: "Sənəd analizi zamanı xəta baş verdi: " + error.message
-      }]
+      content: [{ text: "Sənəd analizi zamanı xəta baş verdi: " + error.message }]
     });
   }
 });
 
-// ================== 3. TTS ==================
+// ================== 3. TTS (Text-to-Speech) ==================
 app.get('/api/tts', async (req, res) => {
   try {
     const text = (req.query.text || '').toString();
@@ -322,14 +300,14 @@ app.get('/api/tts', async (req, res) => {
     const clean = text
       .replace(/<[^>]*>?/gm, '')
       .replace(/[*_#`~]/g, '')
-      .slice(0, 200);
+      .slice(0, 300);
 
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(clean)}&tl=${tl}&client=tw-ob`;
 
     const response = await axios.get(url, {
       responseType: 'stream',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Referer': 'https://translate.google.com/'
       },
       timeout: 20000
@@ -343,17 +321,16 @@ app.get('/api/tts', async (req, res) => {
   }
 });
 
-// ================== Sağlamlıq ==================
+// ================== SAĞLAMLIQ YOXLAMASI ==================
 app.get('/', (req, res) => {
   res.send("Normisera Backend API işləyir ✅");
 });
 
 app.get('/health', (req, res) => {
-  const keyValid = !!GROQ_API_KEY && GROQ_API_KEY.startsWith("gsk_") && GROQ_API_KEY.length > 20;
+  const keyValid = !!GROQ_API_KEY && GROQ_API_KEY.startsWith("gsk_");
   res.json({
     ok: true,
     groqKeySet: keyValid,
-    keyLength: GROQ_API_KEY.length,
     keyPrefix: GROQ_API_KEY ? GROQ_API_KEY.slice(0, 8) + "..." : "yoxdur"
   });
 });
