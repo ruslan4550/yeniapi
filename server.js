@@ -26,8 +26,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // ================== GROQ AYARLARI ==================
 // Açar Render-də Environment Variable kimi təyin olunur: GROQ_API_KEY
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
+const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 
 // Başlanğıc yoxlaması
 console.log("=========================================");
