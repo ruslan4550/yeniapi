@@ -24,12 +24,10 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ================== GROQ AYARLARI ==================
-// Açar Render-də Environment Variable kimi təyin olunur: GROQ_API_KEY
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_CHAT_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 
-// Başlanğıc yoxlaması
 console.log("=========================================");
 console.log("GROQ_API_KEY təyin olunub:", !!GROQ_API_KEY);
 console.log("GROQ_API_KEY uzunluq:", GROQ_API_KEY.length);
@@ -86,20 +84,14 @@ async function callGroqChat(messages, systemPrompt) {
     const detail = err.response?.data;
     console.error("Groq xətası | status:", status, "| detail:", JSON.stringify(detail));
 
-    if (status === 401) {
-      throw new Error("Groq API açarı etibarsızdır (401). Render-də GROQ_API_KEY-i yeniləyin.");
-    }
-    if (status === 429) {
-      throw new Error("Groq limiti aşıldı (429). Bir az sonra yenidən cəhd edin.");
-    }
-    if (detail?.error?.message) {
-      throw new Error("Groq: " + detail.error.message);
-    }
+    if (status === 401) throw new Error("Groq API açarı etibarsızdır (401).");
+    if (status === 429) throw new Error("Groq limiti aşıldı (429). Bir az sonra yenidən cəhd edin.");
+    if (detail?.error?.message) throw new Error("Groq: " + detail.error.message);
     throw new Error("Groq xətası: " + (err.message || "Bilinməyən"));
   }
 }
 
-// ================== GROQ VISION (şəkillər) ==================
+// ================== GROQ VISION ==================
 async function callGroqVision(systemPrompt, userText, imageDataUrl) {
   if (!GROQ_API_KEY || !GROQ_API_KEY.startsWith("gsk_")) {
     throw new Error("GROQ_API_KEY təyin olunmayıb.");
@@ -155,13 +147,11 @@ async function extractTextFromFile(fileData) {
   const name = (fileData.name || '').toLowerCase();
 
   try {
-    // PDF
     if (type.includes('pdf') || name.endsWith('.pdf')) {
       const pdfParse = require('pdf-parse');
       const data = await pdfParse(buffer);
       return data.text || '';
     }
-    // DOCX
     if (
       type.includes('wordprocessingml') ||
       type.includes('officedocument') ||
@@ -171,7 +161,6 @@ async function extractTextFromFile(fileData) {
       const result = await mammoth.extractRawText({ buffer });
       return result.value || '';
     }
-    // XLSX
     if (
       type.includes('spreadsheetml') ||
       name.endsWith('.xlsx') ||
@@ -186,7 +175,6 @@ async function extractTextFromFile(fileData) {
       });
       return text;
     }
-    // TXT
     if (type.includes('text/plain') || name.endsWith('.txt')) {
       return buffer.toString('utf-8');
     }
@@ -222,10 +210,11 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// ================== 2. SƏNƏD ANALİZİ ENDPOINT ==================
+// ================== 2. SƏNƏD ANALİZİ ENDPOINT (İKİ MƏRHƏLƏLİ) ==================
 app.post('/api/analyze', async (req, res) => {
   try {
-    const { messages, plan, fileData, lang } = req.body;
+    const { messages, plan, fileData, lang, mode } = req.body;
+    // mode: 'risks' (default) | 'safe'
 
     if (plan === "Pulsuz") {
       return res.json({
@@ -242,21 +231,37 @@ app.post('/api/analyze', async (req, res) => {
     }
 
     const langInstr = getLanguageInstruction(lang || 'az');
+    const isSafeMode = mode === 'safe';
 
-    const systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analitikisən.
-Təqdim olunan sənədi və ya müqavilə mətnini dərindən təhlil et.
+    let systemPrompt;
+    if (isSafeMode) {
+      systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünassan.
+Təqdim olunan sənədin TAM RİSKSİZ, İSTİFADƏYƏ HAZIR VERSİYASINI hazırla.
 
-CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
+TƏLƏBLƏR:
+- Bütün riskli, birtərəfli, cərimə yükü yaradan, hüquqları məhdudlaşdıran bəndləri sil və ya istifadəçinin xeyrinə dəyişdir.
+- Sənədin tam strukturunu (başlıq, tərəflər, bəndlər, imza yeri) qoru.
+- Mətn HÜQUQİ CƏHƏTDƏN TƏHLÜKƏSİZ və BALANSLI olsun.
+- TAM müqavilə mətnini (başlıqdan imza yerinə qədər) təqdim et.
+- HEÇ BİR əlavə izah, giriş və ya nəticə yazma - YALNIZ sənədin özünü ver.
+
+[DİL TƏLƏBİ]: ${langInstr}`;
+    } else {
+      systemPrompt = `Sən yüksək ixtisaslı, peşəkar hüquqşünas və sənəd analitikisən.
+Təqdim olunan sənədi dərindən təhlil et və YALNIZ aşağıdakı strukturu təqdim et:
 
 1. ⚠️ HÜQUQİ RİSKLƏR VƏ ZƏRƏRLİ BƏNDLƏR
    - Sənəddə istifadəçi üçün riskli, birtərəfli, cərimə yükü yaradan və ya hüquqları məhdudlaşdıran BÜTÜN maddələri bənd-bənd göstər və izah et.
+   - Hər bir bənd üçün: "Bənd X: [risk təsviri] → [niyə risklidir]"
 
-2. 🛡️ DÜZƏLDİLMİŞ VƏ RİSKSİZ MÜQAVİLƏ (TAM SƏNƏD MƏTNİ)
-   - Sənədi tamamilə yenidən tərtib et.
-   - Bütün riskli bəndləri sil və ya istifadəçinin xeyrinə, tam hüquqi təhlükəsiz variantla əvəz et.
-   - Düzəldilmiş risksiz müqavilə mətnini İSTİFADƏYƏ HAZIR ŞƏKİLDƏ (tam müqavilə formasında) təqdim et.
+2. 📋 ÜMUMİ HÜQUQİ QİYMƏTLƏNDİRMƏ
+   - Sənədin ümumi hüquqi vəziyyəti və istifadəçiyə tövsiyələr.
+
+QADAĞAN: Düzəldilmiş/risksiz versiyanı YAZMA - istifadəçi ayrıca tələb edəcək.
+Yalnız analiz və riskləri göstər.
 
 [DİL TƏLƏBİ]: ${langInstr}`;
+    }
 
     const fileType = (fileData.type || '').toLowerCase();
     const isImage = fileType.startsWith('image/');
@@ -265,9 +270,9 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
 
     if (isImage) {
       const dataUrl = `data:${fileData.type};base64,${fileData.base64}`;
-      const userText =
-        (messages && messages[0]?.content) ||
-        "Bu sənədi analiz et: riskləri göstər və düzəldilmiş risksiz versiyanı çıxar.";
+      const userText = isSafeMode
+        ? "Bu sənədin tam risksiz, istifadəyə hazır versiyasını hazırla. Yalnız sənədin özünü ver."
+        : "Bu sənədi analiz et və yalnız riskli bəndləri göstər.";
       answerText = await callGroqVision(systemPrompt, userText, dataUrl);
     } else {
       const extracted = await extractTextFromFile(fileData);
@@ -282,7 +287,9 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
 
       const trimmed = extracted.slice(0, 15000);
 
-      const userContent = `Aşağıdakı sənədi hüquqi baxımdan tam analiz et, riskli bəndləri göstər və düzəldilmiş risksiz müqaviləni tam şəkildə təqdim et:\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`;
+      const userContent = isSafeMode
+        ? `Aşağıdakı sənədin TAM RİSKSİZ, İSTİFADƏYƏ HAZIR VERSİYASINI hazırla (yalnız sənədin özünü ver, izah yazma):\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`
+        : `Aşağıdakı sənədi hüquqi baxımdan təhlil et və YALNIZ riskli bəndləri bənd-bənd göstər:\n\n--- SƏNƏD BAŞLANĞICI ---\n${trimmed}\n--- SƏNƏD SONU ---`;
 
       answerText = await callGroqChat(
         [{ role: 'user', content: userContent }],
@@ -301,7 +308,7 @@ CAVABIN MÜTLƏQ AŞAĞIDAKI STRUKTURDA OLSUN:
   }
 });
 
-// ================== 3. TTS (Text-to-Speech) ==================
+// ================== 3. TTS ==================
 app.get('/api/tts', async (req, res) => {
   try {
     const text = (req.query.text || '').toString();
@@ -322,8 +329,7 @@ app.get('/api/tts', async (req, res) => {
     const response = await axios.get(url, {
       responseType: 'stream',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
         'Referer': 'https://translate.google.com/'
       },
       timeout: 20000
@@ -337,7 +343,7 @@ app.get('/api/tts', async (req, res) => {
   }
 });
 
-// ================== Sağlamlıq yoxlaması ==================
+// ================== Sağlamlıq ==================
 app.get('/', (req, res) => {
   res.send("Normisera Backend API işləyir ✅");
 });
