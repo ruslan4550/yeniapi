@@ -17,6 +17,9 @@ const API_BASE = "https://api.groq.com/openai/v1";
 const CHAT_MODEL =
   process.env.GROQ_CHAT_MODEL || "openai/gpt-oss-120b";
 
+// Note: qwen/qwen3.8-27b allows a max of 3 images per request (qwen3.6-27b
+// allows 5), so images sent to vision are capped at 3 everywhere below to
+// stay within the strictest model's limit regardless of which one answers.
 const VISION_MODELS = [
   process.env.GROQ_VISION_MODEL,
   "qwen/qwen3.6-27b",
@@ -231,7 +234,10 @@ async function groqVision(messages) {
 
       const status = error.response?.status;
 
-      if (status !== 400 && status !== 404) {
+      // 400/404 = model rejected the request or doesn't exist; 413 = payload
+      // too large for that model's limits. In all three cases we try the
+      // next configured vision model instead of failing immediately.
+      if (status !== 400 && status !== 404 && status !== 413) {
         throw error;
       }
     }
@@ -248,15 +254,77 @@ function extractTextFromGroq(response) {
   );
 }
 
+// Primary extractor: pdfjs-dist. This is the actively-maintained Mozilla
+// pdf.js engine and correctly reads modern PDFs (Word/Chrome/LibreOffice
+// "Save as PDF", scanner apps, xref streams, etc). The older "pdf-parse"
+// package bundles a very outdated pdf.js build that throws on many valid
+// real-world PDFs (e.g. "bad XRef entry"), which was silently turning real,
+// text-based PDFs into false "no text layer" results.
+async function extractPdfTextWithPdfjs(buffer) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    useSystemFonts: true,
+    disableFontFace: true,
+    isEvalSupported: false
+  });
+
+  const doc = await loadingTask.promise;
+
+  let fullText = "";
+
+  try {
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+
+      const pageText = content.items
+        .map(item => (typeof item.str === "string" ? item.str : ""))
+        .join(" ");
+
+      fullText += pageText.trim() + "\n\n";
+    }
+  } finally {
+    try {
+      await doc.destroy();
+    } catch (destroyError) {
+      // ignore cleanup errors
+    }
+  }
+
+  return fullText.trim();
+}
+
+// Fallback extractor kept for edge cases pdfjs-dist itself might choke on.
+async function extractPdfTextWithPdfParse(buffer) {
+  const pdfParse = require("pdf-parse");
+  const result = await pdfParse(buffer);
+  return (result.text || "").trim();
+}
+
 async function extractPdfText(buffer) {
   try {
-    const pdfParse = require("pdf-parse");
-    const result = await pdfParse(buffer);
-    return result.text || "";
+    const text = await extractPdfTextWithPdfjs(buffer);
+
+    if (text && text.length > 0) {
+      return text;
+    }
   } catch (error) {
-    console.error("PDF EXTRACT ERROR:", error.message);
-    return "";
+    console.error("PDF EXTRACT ERROR (pdfjs-dist):", error.message);
   }
+
+  try {
+    const text = await extractPdfTextWithPdfParse(buffer);
+
+    if (text && text.length > 0) {
+      return text;
+    }
+  } catch (error) {
+    console.error("PDF EXTRACT ERROR (pdf-parse fallback):", error.message);
+  }
+
+  return "";
 }
 
 async function extractDocxText(buffer) {
@@ -296,6 +364,66 @@ async function extractXlsxText(buffer) {
   } catch (error) {
     console.error("XLSX EXTRACT ERROR:", error.message);
     return "";
+  }
+}
+
+// Groq's vision models reject base64-encoded images above ~4MB (and some
+// models cap even lower). Phone camera photos routinely exceed this, which
+// was causing every "real" jpg/png upload to fail with an unhandled error.
+// This resizes/recompresses the image so it reliably fits, while keeping it
+// readable for OCR/analysis.
+const VISION_IMAGE_TARGET_BYTES = 3 * 1024 * 1024; // raw bytes, pre-base64
+const VISION_IMAGE_MAX_DIMENSION = 2200;
+
+async function compressImageForVision(buffer) {
+  const sharp = require("sharp");
+
+  let width = VISION_IMAGE_MAX_DIMENSION;
+  let quality = 85;
+
+  let output = await sharp(buffer, { failOn: "none" })
+    .rotate() // apply EXIF orientation, then strip it
+    .resize({
+      width,
+      height: width,
+      fit: "inside",
+      withoutEnlargement: true
+    })
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer();
+
+  let attempts = 0;
+
+  while (output.length > VISION_IMAGE_TARGET_BYTES && attempts < 6) {
+    attempts += 1;
+    quality = Math.max(35, quality - 15);
+    width = Math.round(width * 0.8);
+
+    output = await sharp(buffer, { failOn: "none" })
+      .rotate()
+      .resize({
+        width,
+        height: width,
+        fit: "inside",
+        withoutEnlargement: true
+      })
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+  }
+
+  return output;
+}
+
+// Converts a raw image buffer into a base64 string safe to send to the
+// vision API. Falls back to the original buffer (uncompressed) if sharp
+// fails for any reason, so a compression bug never blocks analysis outright.
+async function toVisionImageBase64(buffer) {
+  try {
+    const compressed = await compressImageForVision(buffer);
+    return compressed.toString("base64");
+  } catch (error) {
+    console.error("IMAGE COMPRESS ERROR:", error.message);
+    return buffer.toString("base64");
   }
 }
 
@@ -375,10 +503,14 @@ async function getChatFileContent(fileData) {
 
   if (Array.isArray(fileData.pages)) {
     for (const page of fileData.pages) {
-      if (page?.base64 || page?.data) {
-        images.push(
-          page.base64 || page.data
-        );
+      const pageBase64 = page?.base64 || page?.data;
+
+      if (pageBase64) {
+        const pageBuffer = decodeBase64(pageBase64);
+
+        if (pageBuffer) {
+          images.push(await toVisionImageBase64(pageBuffer));
+        }
       }
     }
   }
@@ -391,7 +523,16 @@ async function getChatFileContent(fileData) {
       /\.(jpg|jpeg|png|webp)$/i.test(fileName)
     )
   ) {
-    images.push(base64);
+    // Re-encode through sharp so large phone photos are resized/compressed
+    // to fit within the vision API's request size limits instead of
+    // failing outright.
+    const imageBuffer = decodeBase64(base64);
+
+    if (imageBuffer) {
+      images.push(await toVisionImageBase64(imageBuffer));
+    } else {
+      images.push(base64);
+    }
   }
 
   return {
@@ -454,7 +595,7 @@ Do not use:
     }
   ];
 
-  for (const image of images.slice(0, 5)) {
+  for (const image of images.slice(0, 3)) {
     let imageUrl = image;
 
     if (!String(image).startsWith("data:")) {
@@ -683,7 +824,7 @@ Rules:
       }
     ];
 
-    for (const image of images.slice(0, 5)) {
+    for (const image of images.slice(0, 3)) {
       let imageUrl = image;
 
       if (!String(image).startsWith("data:")) {
@@ -965,7 +1106,7 @@ Do not invent facts.
       ];
 
       for (
-        const image of fileContent.images.slice(0, 5)
+        const image of fileContent.images.slice(0, 3)
       ) {
         let imageUrl = image;
 
