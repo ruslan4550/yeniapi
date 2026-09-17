@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const path = require("path");
 
 const app = express();
 
@@ -68,6 +69,21 @@ function stripRiskMarkers(text) {
     .trim();
 }
 
+function formatAnalysisSpacing(text) {
+  if (!text) return "";
+
+  let result = String(text);
+
+  result = result.replace(/[ \t]+\n/g, "\n");
+  result = result.replace(/\n{3,}/g, "\n\n");
+  result = result.replace(/\s*\[RISK_START\]\s*/g, "\n\n[RISK_START]\n");
+  result = result.replace(/\s*\[RISK_END\]\s*/g, "\n[RISK_END]\n\n");
+  result = result.replace(/\n{3,}/g, "\n\n");
+  result = result.replace(/^[ \t]+/gm, "");
+
+  return result.trim();
+}
+
 function cleanChatOutput(text) {
   if (!text) return "";
 
@@ -89,6 +105,16 @@ CURRENT PACKAGE:
 ${plan || "Pulsuz"}
 
 IMPORTANT RULES:
+
+0. Self-identity and greetings: you are Normisera, the ASSISTANT helping
+the user. When greeting the user or introducing yourself (e.g. "Salam"),
+ALWAYS speak as the one offering help to the user, never the reverse.
+Correct example (Azerbaijani): "Salam! Mən Normiserayam. Sizə necə kömək
+edə bilərəm?"
+NEVER write the grammatically incorrect self-centered form
+"Mənə necə kömək edə bilərəm?" (asking how you can help yourself) — this
+is a mistake and must never appear. Always address the user in second
+person ("sizə", "sizin"), never first person ("mənə") when offering help.
 
 1. Always respond in the selected language.
 
@@ -400,12 +426,21 @@ Identify:
 - jurisdiction/dispute risks
 - missing important information
 
+Formatting requirements (very important):
+- Organize the answer into clearly separated numbered sections (1., 2., 3. ...).
+- Start every new point on its own line/paragraph. Never write a dense
+  wall of text — leave a blank line between sections.
+- Use plain short sentences, no markdown decoration.
+
 For every concrete risky clause, wrap the exact relevant wording or a
 faithful short representation between:
 
 [RISK_START]
 ...
 [RISK_END]
+
+Put each [RISK_START]...[RISK_END] block on its own line, separated by
+blank lines from the surrounding text.
 
 Do not rewrite or correct the document yet.
 
@@ -452,8 +487,10 @@ Do not invent missing facts.
 
   const response = await groqVision(messages);
 
-  return cleanChatOutput(
-    extractTextFromGroq(response)
+  return formatAnalysisSpacing(
+    cleanChatOutput(
+      extractTextFromGroq(response)
+    )
   );
 }
 
@@ -487,11 +524,20 @@ Identify:
 - jurisdiction/dispute risks
 - missing information
 
+Formatting requirements (very important):
+- Organize the answer into clearly separated numbered sections (1., 2., 3. ...).
+- Start every new point on its own line/paragraph. Never write a dense
+  wall of text — leave a blank line between sections.
+- Use plain short sentences, no markdown decoration.
+
 For each concrete risky clause, wrap it exactly or faithfully between:
 
 [RISK_START]
 ...
 [RISK_END]
+
+Put each [RISK_START]...[RISK_END] block on its own line, separated by
+blank lines from the surrounding text.
 
 Important:
 Analyze only.
@@ -520,8 +566,10 @@ ${languageInstruction(lang)}
       }
     ]);
 
-    return cleanChatOutput(
-      extractTextFromGroq(response)
+    return formatAnalysisSpacing(
+      cleanChatOutput(
+        extractTextFromGroq(response)
+      )
     );
   }
 
@@ -686,6 +734,135 @@ function formatWasRequested(messages) {
       String(message.content || "")
     )
   );
+}
+
+async function buildDocxBuffer(title, text) {
+  const {
+    Document,
+    Packer,
+    Paragraph,
+    TextRun,
+    HeadingLevel
+  } = require("docx");
+
+  const lines = String(text || "").split("\n");
+
+  const children = [
+    new Paragraph({
+      text: title,
+      heading: HeadingLevel.HEADING_1
+    }),
+    new Paragraph({ text: "" })
+  ];
+
+  for (const line of lines) {
+    children.push(
+      new Paragraph({
+        children: [new TextRun(line)]
+      })
+    );
+  }
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {},
+        children
+      }
+    ]
+  });
+
+  return await Packer.toBuffer(doc);
+}
+
+function buildPdfBuffer(title, text) {
+  const PDFDocument = require("pdfkit");
+
+  const fontRegular = path.join(__dirname, "fonts", "DejaVuSans.ttf");
+  const fontBold = path.join(__dirname, "fonts", "DejaVuSans-Bold.ttf");
+
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 50 });
+      const chunks = [];
+
+      doc.on("data", chunk => chunks.push(chunk));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+
+      try {
+        doc.font(fontBold).fontSize(16).text(title);
+        doc.moveDown();
+        doc.font(fontRegular).fontSize(11).text(String(text || ""), {
+          align: "left"
+        });
+      } catch (fontError) {
+        console.error("PDF FONT ERROR:", fontError.message);
+        doc.fontSize(16).text(title);
+        doc.moveDown();
+        doc.fontSize(11).text(String(text || ""));
+      }
+
+      doc.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function buildXlsxBuffer(title, text) {
+  const XLSX = require("xlsx");
+
+  const lines = String(text || "").split("\n");
+  const rows = [[title], [""], ...lines.map(line => [line])];
+
+  const sheet = XLSX.utils.aoa_to_sheet(rows);
+  sheet["!cols"] = [{ wch: 100 }];
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, sheet, "Sənəd");
+
+  return XLSX.write(workbook, {
+    type: "buffer",
+    bookType: "xlsx"
+  });
+}
+
+const FORMAT_META = {
+  docx: {
+    ext: "docx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  },
+  pdf: {
+    ext: "pdf",
+    mimeType: "application/pdf"
+  },
+  xlsx: {
+    ext: "xlsx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  }
+};
+
+async function buildDeliverableFile(format, title, text) {
+  const fmt = FORMAT_META[format] ? format : "docx";
+
+  let buffer;
+
+  if (fmt === "pdf") {
+    buffer = await buildPdfBuffer(title, text);
+  } else if (fmt === "xlsx") {
+    buffer = buildXlsxBuffer(title, text);
+  } else {
+    buffer = await buildDocxBuffer(title, text);
+  }
+
+  return {
+    buffer,
+    ext: FORMAT_META[fmt].ext,
+    mimeType: FORMAT_META[fmt].mimeType
+  };
 }
 
 app.get("/health", (req, res) => {
@@ -985,7 +1162,8 @@ app.post("/api/rewrite", async (req, res) => {
       fileData,
       analysis = "",
       lang = "az",
-      plan = "Pulsuz"
+      plan = "Pulsuz",
+      format = "docx"
     } = req.body;
 
     if (
@@ -1015,12 +1193,31 @@ app.post("/api/rewrite", async (req, res) => {
 
     answer = stripRiskMarkers(answer);
 
+    if (!answer || answer.trim().length < 10) {
+      return res.status(422).json({
+        ok: false,
+        error: "Düzəldilmiş sənəd hazırlana bilmədi."
+      });
+    }
+
     const originalName =
       (fileData && (fileData.name || fileData.fileName)) ||
       "sened";
 
     const baseName =
       originalName.replace(/\.[^.]+$/, "") || "sened";
+
+    const title = "Normisera — Düzəldilmiş sənəd";
+
+    const {
+      buffer,
+      ext,
+      mimeType
+    } = await buildDeliverableFile(
+      String(format || "docx").toLowerCase(),
+      title,
+      answer
+    );
 
     res.json({
       ok: true,
@@ -1030,7 +1227,9 @@ app.post("/api/rewrite", async (req, res) => {
         }
       ],
       documentText: answer,
-      fileName: `Normisera-risksiz-${baseName}.doc`
+      fileBase64: buffer.toString("base64"),
+      mimeType,
+      fileName: `Normisera-risksiz-${baseName}.${ext}`
     });
 
   } catch (error) {
