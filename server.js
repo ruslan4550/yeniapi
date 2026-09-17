@@ -48,12 +48,24 @@ function cleanDocumentOutput(text) {
 
   result = result.replace(/\*\*\*/g, "");
   result = result.replace(/\*\*/g, "");
-  result = result.replace(/###/g, "");
+  result = result.replace(/\*/g, "");
+  result = result.replace(/#{1,6}\s?/g, "");
+  result = result.replace(/_{2,}/g, "");
+  result = result.replace(/`{1,3}/g, "");
 
   result = result.replace(/\r\n/g, "\n");
   result = result.replace(/\n{4,}/g, "\n\n");
 
   return result.trim();
+}
+
+function stripRiskMarkers(text) {
+  if (!text) return "";
+
+  return String(text)
+    .replace(/\[RISK_START\]/gi, "")
+    .replace(/\[RISK_END\]/gi, "")
+    .trim();
 }
 
 function cleanChatOutput(text) {
@@ -216,6 +228,7 @@ async function extractPdfText(buffer) {
     const result = await pdfParse(buffer);
     return result.text || "";
   } catch (error) {
+    console.error("PDF EXTRACT ERROR:", error.message);
     return "";
   }
 }
@@ -228,6 +241,7 @@ async function extractDocxText(buffer) {
     });
     return result.value || "";
   } catch (error) {
+    console.error("DOCX EXTRACT ERROR:", error.message);
     return "";
   }
 }
@@ -254,6 +268,7 @@ async function extractXlsxText(buffer) {
 
     return parts.join("\n\n");
   } catch (error) {
+    console.error("XLSX EXTRACT ERROR:", error.message);
     return "";
   }
 }
@@ -518,8 +533,12 @@ ${languageInstruction(lang)}
   }
 
   return `
-Sənəddən oxuna bilən mətn əldə etmək mümkün olmadı.
-Zəhmət olmasa sənədi yenidən yükləyin və ya daha keyfiyyətli fayl göndərin.
+Bu PDF-dən mətn çıxarmaq mümkün olmadı. Bu adətən sənəd skan edilmiş
+şəkillərdən ibarət olduqda (mətn qatı olmayan PDF) baş verir.
+
+Zəhmət olmasa:
+- sənədi JPG/PNG şəkil kimi yenidən yükləyin, və ya
+- mətn qatı olan (kopyalanabilir) PDF ilə yenidən cəhd edin.
 `;
 }
 
@@ -987,12 +1006,21 @@ app.post("/api/rewrite", async (req, res) => {
       });
     }
 
-    const answer =
+    let answer =
       await rewriteDocument(
         fileData,
         analysis,
         lang
       );
+
+    answer = stripRiskMarkers(answer);
+
+    const originalName =
+      (fileData && (fileData.name || fileData.fileName)) ||
+      "sened";
+
+    const baseName =
+      originalName.replace(/\.[^.]+$/, "") || "sened";
 
     res.json({
       ok: true,
@@ -1000,7 +1028,9 @@ app.post("/api/rewrite", async (req, res) => {
         {
           text: answer
         }
-      ]
+      ],
+      documentText: answer,
+      fileName: `Normisera-risksiz-${baseName}.doc`
     });
 
   } catch (error) {
