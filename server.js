@@ -246,6 +246,42 @@ async function groqVision(messages) {
   throw lastError || new Error("No vision model is available.");
 }
 
+function visionFailureMessage(lang) {
+  if (lang === "ru") {
+    return "Произошла ошибка при отправке изображения в AI-сервис для анализа. Пожалуйста, попробуйте ещё раз через некоторое время или загрузите более чёткое/меньшее по размеру изображение.";
+  }
+
+  if (lang === "en") {
+    return "There was an error sending the image to the AI service. Please try again shortly, or upload a clearer / smaller image.";
+  }
+
+  return "Şəkli analiz üçün AI xidmətinə göndərərkən xəta baş verdi. Zəhmət olmasa bir az sonra yenidən cəhd edin, ya da daha aydın/kiçik ölçülü bir şəkil ilə yenidən yükləyin.";
+}
+
+// Wraps groqVision so that a vision failure (model outage, rate limit, an
+// image that still doesn't fit after compression, etc.) turns into a
+// friendly, user-visible message instead of an uncaught exception. An
+// uncaught exception here used to make /api/analyze return a bare 500 with
+// no "content" field, which the frontend then displayed as the generic
+// "Analiz cavabı alınmadı" error with no useful detail.
+async function groqVisionSafe(messages, lang) {
+  try {
+    const data = await groqVision(messages);
+    return { failed: false, data };
+  } catch (error) {
+    console.error(
+      "VISION ERROR:",
+      error.response?.status,
+      error.response?.data || error.message
+    );
+
+    return {
+      failed: true,
+      message: visionFailureMessage(lang)
+    };
+  }
+}
+
 function extractTextFromGroq(response) {
   return (
     response?.data?.choices?.[0]?.message?.content ||
@@ -372,50 +408,54 @@ async function extractXlsxText(buffer) {
 // was causing every "real" jpg/png upload to fail with an unhandled error.
 // This resizes/recompresses the image so it reliably fits, while keeping it
 // readable for OCR/analysis.
-const VISION_IMAGE_TARGET_BYTES = 3 * 1024 * 1024; // raw bytes, pre-base64
-const VISION_IMAGE_MAX_DIMENSION = 2200;
+//
+// Uses "jimp" (pure JavaScript, no native/binary dependencies) instead of
+// libraries like "sharp" on purpose: native image libraries can fail to
+// install or load correctly on some hosting platforms (wrong prebuilt
+// binary for the deploy vs. runtime environment), which silently breaks
+// every image upload in a way that's hard to diagnose. jimp trades a bit of
+// speed for working identically everywhere Node.js runs.
+const VISION_IMAGE_TARGET_BYTES = 2.6 * 1024 * 1024; // raw bytes, pre-base64
+const VISION_IMAGE_MAX_DIMENSION = 2000;
+const VISION_IMAGE_MIN_DIMENSION = 500;
 
 async function compressImageForVision(buffer) {
-  const sharp = require("sharp");
+  const { Jimp } = require("jimp");
 
-  let width = VISION_IMAGE_MAX_DIMENSION;
-  let quality = 85;
+  const image = await Jimp.read(buffer);
 
-  let output = await sharp(buffer, { failOn: "none" })
-    .rotate() // apply EXIF orientation, then strip it
-    .resize({
-      width,
-      height: width,
-      fit: "inside",
-      withoutEnlargement: true
-    })
-    .jpeg({ quality, mozjpeg: true })
-    .toBuffer();
+  let width = Math.min(image.bitmap.width, VISION_IMAGE_MAX_DIMENSION);
+  let quality = 82;
 
+  const render = async (targetWidth, targetQuality) => {
+    const clone = image.clone();
+
+    if (clone.bitmap.width > targetWidth) {
+      clone.resize({ w: targetWidth });
+    }
+
+    return await clone.getBuffer("image/jpeg", { quality: targetQuality });
+  };
+
+  let output = await render(width, quality);
   let attempts = 0;
 
-  while (output.length > VISION_IMAGE_TARGET_BYTES && attempts < 6) {
+  while (output.length > VISION_IMAGE_TARGET_BYTES && attempts < 7) {
     attempts += 1;
-    quality = Math.max(35, quality - 15);
-    width = Math.round(width * 0.8);
+    quality = Math.max(30, quality - 12);
+    width = Math.max(
+      VISION_IMAGE_MIN_DIMENSION,
+      Math.round(width * 0.8)
+    );
 
-    output = await sharp(buffer, { failOn: "none" })
-      .rotate()
-      .resize({
-        width,
-        height: width,
-        fit: "inside",
-        withoutEnlargement: true
-      })
-      .jpeg({ quality, mozjpeg: true })
-      .toBuffer();
+    output = await render(width, quality);
   }
 
   return output;
 }
 
 // Converts a raw image buffer into a base64 string safe to send to the
-// vision API. Falls back to the original buffer (uncompressed) if sharp
+// vision API. Falls back to the original buffer (uncompressed) if jimp
 // fails for any reason, so a compression bug never blocks analysis outright.
 async function toVisionImageBase64(buffer) {
   try {
@@ -626,11 +666,15 @@ Do not invent missing facts.
     }
   ];
 
-  const response = await groqVision(messages);
+  const response = await groqVisionSafe(messages, lang);
+
+  if (response.failed) {
+    return response.message;
+  }
 
   return formatAnalysisSpacing(
     cleanChatOutput(
-      extractTextFromGroq(response)
+      extractTextFromGroq(response.data)
     )
   );
 }
@@ -1085,6 +1129,8 @@ Do not invent information not contained in the document.
     }
 
     let response;
+    let visionAnswer = null;
+
 
     if (
       fileContent.images.length &&
@@ -1128,10 +1174,20 @@ Do not invent facts.
         content: visionContent
       });
 
-      response =
-        await groqVision(
-          finalMessages
+      try {
+        response =
+          await groqVision(
+            finalMessages
+          );
+      } catch (visionError) {
+        console.error(
+          "CHAT VISION ERROR:",
+          visionError.response?.status,
+          visionError.response?.data || visionError.message
         );
+
+        visionAnswer = visionFailureMessage(lang);
+      }
     } else {
       const formatSelected =
         hasFormat(lastUserText);
@@ -1178,9 +1234,11 @@ If information is missing, use:
     }
 
     let answer =
-      cleanChatOutput(
-        extractTextFromGroq(response)
-      );
+      visionAnswer !== null
+        ? visionAnswer
+        : cleanChatOutput(
+            extractTextFromGroq(response)
+          );
 
     const formatSelected =
       hasFormat(lastUserText);
